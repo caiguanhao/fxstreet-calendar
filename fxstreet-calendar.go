@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -12,27 +11,47 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/go-redis/redis"
 )
 
-type Event struct {
-	Month      string `json:"month"`
-	Day        string `json:"day"`
-	Time       string `json:"time"`
-	Country    string `json:"country"`
-	Currency   string `json:"currency"`
-	Title      string `json:"title"`
-	Volatility string `json:"volatility"`
-	Actual     string `json:"actual"`
-	Consensus  string `json:"consensus"`
-	Previous   string `json:"previous"`
-	Revised    string `json:"revised"`
-}
+type (
+	Configs struct {
+		RedisAddress  string `json:"redisAddress"`
+		RedisDatabase int    `json:"redisDatabase"`
+		Interval      int    `json:"interval"`
+	}
+
+	Event struct {
+		Month      string `json:"month"`
+		Day        string `json:"day"`
+		Time       string `json:"time"`
+		Country    string `json:"country"`
+		Currency   string `json:"currency"`
+		Title      string `json:"title"`
+		Volatility string `json:"volatility"`
+		Actual     string `json:"actual"`
+		Consensus  string `json:"consensus"`
+		Previous   string `json:"previous"`
+		Revised    string `json:"revised"`
+	}
+)
+
+var (
+	configs = Configs{
+		RedisAddress:  "localhost:6379",
+		RedisDatabase: 15,
+		Interval:      30,
+	}
+
+	redisClient *redis.Client
+)
 
 func online() *goquery.Document {
 	var req *http.Request
 	req, err := http.NewRequest("GET", "https://calendar.fxstreet.com/EventDateWidget/GetMini", nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return nil
 	}
 	q := req.URL.Query()
 	q.Add("culture", "zh-CN")
@@ -51,17 +70,20 @@ func online() *goquery.Document {
 
 	res, err := client.Do(req)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return nil
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
 		err = errors.New("status code != 200")
-		log.Fatal(err)
+		log.Println(err)
+		return nil
 	}
 	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return nil
 	}
 	return doc
 }
@@ -69,12 +91,14 @@ func online() *goquery.Document {
 func offline() *goquery.Document {
 	file, err := os.Open("data.html")
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return nil
 	}
 	defer file.Close()
 	doc, err := goquery.NewDocumentFromReader(file)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return nil
 	}
 	return doc
 }
@@ -83,8 +107,11 @@ func f(input string) string {
 	return strings.TrimSpace(input)
 }
 
-func main() {
+func getAndSet() {
 	doc := online()
+	if doc == nil {
+		return
+	}
 	re := regexp.MustCompile("[0-9]+")
 	currentMonth, currentDay := "", ""
 	events := []Event{}
@@ -97,7 +124,7 @@ func main() {
 				Month:      currentMonth,
 				Day:        currentDay,
 				Time:       f(tr.Find(".fxst-td-time").Text()),
-				Country:    f(tr.Find(".fxst-flag").Text()),
+				Country:    f(tr.Find(".fxst-flag").AttrOr("title", "")),
 				Currency:   f(tr.Find(".fxst-td-currency").Text()),
 				Title:      f(tr.Find(".fxst-td-event").Text()),
 				Volatility: f(tr.Find(".fxst-td-vol").Text()),
@@ -111,7 +138,42 @@ func main() {
 	})
 	bytes, err := json.Marshal(events)
 	if err != nil {
+		log.Println(err)
+		return
+	}
+	if err = redisClient.Set("forex:calendar", string(bytes), 0).Err(); err != nil {
+		log.Println(err)
+		return
+	}
+	log.Println("OK")
+}
+
+func init() {
+	var err error
+
+	var file *os.File
+	file, err = os.Open("fxstreet-calendar-configs.json")
+	if err == nil {
+		defer file.Close()
+		decoder := json.NewDecoder(file)
+		if err = decoder.Decode(&configs); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: configs.RedisAddress,
+		DB:   configs.RedisDatabase,
+	})
+	_, err = redisClient.Ping().Result()
+	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(string(bytes))
+}
+
+func main() {
+	for {
+		getAndSet()
+		time.Sleep(time.Duration(configs.Interval) * time.Second)
+	}
 }
